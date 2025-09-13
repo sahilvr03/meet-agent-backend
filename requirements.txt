@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+motor
+whisper
+deep-translator
+pydub
+openai
+openai-agents[litellm]
+nest_asyncio
