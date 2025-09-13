@@ -22,11 +22,12 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import firebase_admin
 from firebase_admin import credentials, auth
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # Initialize Firebase Admin SDK
 # Replace with the actual path to your Firebase Admin SDK JSON file, e.g., "path/to/serviceAccountKey.json"
 # Alternatively, set the path in an environment variable for security
-FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "oops.json")
+FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "serviceAccountKey.json")
 if not firebase_admin._apps:
     try:
         cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
@@ -40,24 +41,25 @@ app = FastAPI(title="TalkToText Pro API")
 # Allow requests from specific origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "ws://localhost:3000", "ws://localhost:3001"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*", "Authorization"],
+    allow_headers=["Authorization"],
 )
 
 # Ensure upload directory exists
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-
+security = HTTPBearer()
 # Dependency to get authenticated user ID from Firebase token
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+# Replace this import
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         token = credentials.credentials
         decoded_token = auth.verify_id_token(token)
         return decoded_token["uid"]
     except Exception as e:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-
 # Live Session Manager for WebSocket
 class LiveSessionManager:
     def __init__(self):
@@ -122,18 +124,29 @@ class LiveSessionManager:
 live_manager = LiveSessionManager()
 
 @app.websocket("/live-transcribe")
-async def live_transcribe(websocket: WebSocket, language: str = Query("en"), user_id: str = Depends(get_current_user)):
-    run_id = str(uuid.uuid4())
-    await meetings.insert_one({
-        "run_id": run_id,
-        "user_id": user_id,
-        "status": "live",
-        "file_path": None,
-        "language": language,
-        "filename": f"Live Meeting {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
-        "created_at": datetime.now(timezone.utc)
-    })
-    await live_manager.handle_live_session(websocket, run_id, language, user_id)
+async def live_transcribe(
+    websocket: WebSocket, 
+    language: str = Query("en"), 
+    token: str = Query(None)  # Get token from query parameter
+):
+    try:
+        # Verify the token
+        decoded_token = auth.verify_id_token(token)
+        user_id = decoded_token["uid"]
+        
+        run_id = str(uuid.uuid4())
+        await meetings.insert_one({
+            "run_id": run_id,
+            "user_id": user_id,
+            "status": "live",
+            "file_path": None,
+            "language": language,
+            "filename": f"Live Meeting {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
+            "created_at": datetime.now(timezone.utc)
+        })
+        await live_manager.handle_live_session(websocket, run_id, language, user_id)
+    except Exception as e:
+        await websocket.close(code=1008, reason="Authentication failed")
 
 @app.post("/upload-audio")
 async def upload_audio(

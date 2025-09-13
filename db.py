@@ -6,3 +6,4 @@ db = client.meto
 meetings = db.meetings
 users = db.users
 conversations = db.conversations  # 👈 Add this
+sessions = db.sessions  # 👈 Add this
