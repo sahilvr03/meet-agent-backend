@@ -10,3 +10,4 @@ openai-agents[litellm]
 nest_asyncio
 aiofiles
 python-dotenv
+langdetect
