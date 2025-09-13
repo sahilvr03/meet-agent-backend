@@ -4,7 +4,7 @@ pydantic
 python-multipart
 aiofiles
 pydub
-whisper
+openai-whisper
 langdetect
 deep-translator
 firebase-admin
