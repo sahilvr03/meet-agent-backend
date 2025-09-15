@@ -8,8 +8,8 @@ from config import UPLOAD_DIR
 from meeting_runner import process_meeting, parse_meeting_output
 from db import meetings, conversations, users
 from chat_agents import chat_agent
-from meeting_agents import master_agent, live_points_agent
-from tools import live_transcribe_chunk, transcribe_audio, translate_text, optimize_text, generate_meeting_notes
+from meeting_agents import master_agent, live_points_agent, process_recorded_audio
+from tools import live_transcribe_chunk, transcribe_audio, translate_text, optimize_text, generate_meeting_notes, transcribe_recorded_audio
 from agents import Runner
 import uuid
 import json
@@ -22,11 +22,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import firebase_admin
 from firebase_admin import credentials, auth
 import logging
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 # Initialize Firebase Admin SDK
 FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH", "serviceAccountKey.json")
 if not firebase_admin._apps:
@@ -35,10 +33,8 @@ if not firebase_admin._apps:
         firebase_admin.initialize_app(cred)
     except FileNotFoundError:
         raise Exception(f"Firebase credentials file not found at {FIREBASE_CREDENTIALS_PATH}")
-
 # Initialize FastAPI app
 app = FastAPI(title="TalkToText Pro API")
-
 # Allow CORS
 app.add_middleware(
     CORSMiddleware,
@@ -47,11 +43,9 @@ app.add_middleware(
     allow_methods=["*", "Authorization"],
     allow_headers=["Authorization"],
 )
-
 # Ensure upload directory exists
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 security = HTTPBearer()
-
 # Dependency to get authenticated user ID
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
@@ -60,12 +54,10 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         return decoded_token["uid"]
     except Exception as e:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-
 # Live Session Manager for WebSocket
 class LiveSessionManager:
     def __init__(self):
-        self.sessions = {}  # run_id -> {'websocket': WebSocket, 'transcript': '', 'accumulated_audio': b'', 'language': str, 'user_id': str}
-
+        self.sessions = {} # run_id -> {'websocket': WebSocket, 'transcript': '', 'accumulated_audio': b'', 'language': str, 'user_id': str}
     async def handle_live_session(self, websocket: WebSocket, run_id: str, language: str, user_id: str):
         self.sessions[run_id] = {
             'websocket': websocket,
@@ -76,7 +68,6 @@ class LiveSessionManager:
         }
         await websocket.accept()
         logger.info(f"WebSocket session started for run_id: {run_id}, user_id: {user_id}")
-
         try:
             while True:
                 data = await websocket.receive()
@@ -88,8 +79,7 @@ class LiveSessionManager:
                         session = self.sessions[run_id]
                         session['accumulated_audio'] += data["bytes"]
                         logger.info(f"Received audio chunk for run_id: {run_id}, size: {len(data['bytes'])}")
-
-                        if len(session['accumulated_audio']) >= 1024:  # Process smaller chunks
+                        if len(session['accumulated_audio']) >= 1024: # Process smaller chunks
                             chunk_transcript = await live_transcribe_chunk(session['accumulated_audio'], session['language'])
                             if chunk_transcript and not chunk_transcript.startswith("Error"):
                                 optimized = await optimize_text(chunk_transcript)
@@ -99,7 +89,6 @@ class LiveSessionManager:
                                 logger.info(f"Processed transcript for run_id: {run_id}: {optimized}")
                             else:
                                 logger.warning(f"No valid transcript for chunk in run_id: {run_id}")
-
                             runner = Runner()
                             context = {"transcript": session['transcript']}
                             result = await runner.run(
@@ -108,12 +97,10 @@ class LiveSessionManager:
                                 context=context
                             )
                             points = parse_meeting_output(result.final_output)
-
                             await meetings.update_one(
                                 {"run_id": run_id},
                                 {"$set": {"partial_transcript": session['transcript'], "partial_points": points}}
                             )
-
                             await websocket.send_json({
                                 "run_id": run_id,
                                 "transcript": optimized if chunk_transcript and not chunk_transcript.startswith("Error") else "",
@@ -122,7 +109,6 @@ class LiveSessionManager:
                                 "sentiment": points.get("sentiment", "neutral")
                             })
                             logger.info(f"Sent transcription update for run_id: {run_id}")
-
                             session['accumulated_audio'] = b''
                     elif "text" in data:
                         try:
@@ -146,9 +132,7 @@ class LiveSessionManager:
                     {"$set": {"status": "done", "result": parse_meeting_output(transcript)}}
                 )
                 logger.info(f"Session cleaned up for run_id: {run_id}")
-
 live_manager = LiveSessionManager()
-
 @app.websocket("/live-transcribe")
 async def live_transcribe(
     websocket: WebSocket,
@@ -163,7 +147,6 @@ async def live_transcribe(
             logger.error(f"User ID mismatch: token UID {decoded_token['uid']}, provided user_id {user_id}")
             await websocket.close(code=1008, reason="User ID mismatch")
             return
-
         run_id = str(uuid.uuid4())
         await meetings.insert_one({
             "run_id": run_id,
@@ -179,7 +162,6 @@ async def live_transcribe(
     except Exception as e:
         logger.error(f"Authentication or initialization failed: {str(e)}")
         await websocket.close(code=1008, reason=f"Authentication failed: {str(e)}")
-
 # [Rest of the server.py code remains unchanged]
 @app.post("/upload-audio")
 async def upload_audio(
@@ -213,6 +195,98 @@ async def upload_audio(
             "language": language
         }
     }
+
+# New Endpoint for Direct Recorded Audio Transcription
+@app.post("/record-and-transcribe")
+async def record_and_transcribe(
+    background_tasks: BackgroundTasks,
+    audio_blob: bytes = File(..., description="Binary audio data from browser recording"),
+    user_id: str = Depends(get_current_user),
+    language: str = Query("en", description="Language of the recorded audio")
+):
+    """
+    New endpoint to handle direct audio blob from browser recording.
+    Automatically transcribes using the new tool and processes through the agent pipeline.
+    """
+    try:
+        # Generate unique run_id
+        run_id = str(uuid.uuid4())
+        
+        # Save meeting record in DB with initial status
+        await meetings.insert_one({
+            "run_id": run_id,
+            "user_id": user_id,
+            "status": "processing",
+            "file_path": None,  # No file path for blob
+            "audio_blob_size": len(audio_blob),
+            "language": language,
+            "filename": f"Recorded Meeting {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
+            "created_at": datetime.now(timezone.utc)
+        })
+        
+        # Process the audio blob through the agent pipeline
+        background_tasks.add_task(process_recorded_blob, audio_blob, run_id, user_id, language)
+        
+        logger.info(f"Started processing recorded audio for run_id: {run_id}, user_id: {user_id}")
+        
+        return {
+            "status": "processing",
+            "run_id": run_id,
+            "message": "Audio recorded and transcription started.",
+            "language": language
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in record_and_transcribe: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing recorded audio: {str(e)}")
+
+# New background task function for processing recorded blob
+async def process_recorded_blob(audio_blob: bytes, run_id: str, user_id: str, language: str):
+    """Background task to process the recorded audio blob."""
+    try:
+        # Use the new tool to transcribe the blob
+        transcript = await transcribe_recorded_audio(audio_blob, language)
+        
+        if transcript.startswith("Error"):
+            await meetings.update_one(
+                {"run_id": run_id},
+                {"$set": {"status": "error", "result": {"error": transcript}}}
+            )
+            return
+        
+        # Optimize and translate if needed
+        optimized = await optimize_text(transcript)
+        if language != "en":
+            optimized = await translate_text(optimized, "en")
+        
+        # Generate meeting notes
+        notes_json = await generate_meeting_notes(optimized)
+        notes = json.loads(notes_json)
+        
+        # Update DB with final result
+        final_result = {
+            "transcript": transcript,
+            "optimized_transcript": optimized,
+            "summary": notes.get("summary", ""),
+            "key_points": notes.get("key_points", []),
+            "decisions": notes.get("decisions", []),
+            "action_items": notes.get("action_items", []),
+            "sentiment": notes.get("sentiment", "neutral")
+        }
+        
+        await meetings.update_one(
+            {"run_id": run_id},
+            {"$set": {"status": "done", "result": final_result}}
+        )
+        
+        logger.info(f"Completed processing recorded audio for run_id: {run_id}")
+        
+    except Exception as e:
+        logger.error(f"Error processing recorded blob for run_id {run_id}: {str(e)}")
+        await meetings.update_one(
+            {"run_id": run_id},
+            {"$set": {"status": "error", "result": {"error": str(e)}}}
+        )
 
 @app.post("/chat/{run_id}")
 async def chat_with_meeting(
@@ -263,7 +337,6 @@ async def chat_with_meeting(
         "response": result.final_output,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
-
 @app.get("/conversations/{run_id}")
 async def get_conversations(run_id: str, user_id: str = Depends(get_current_user)):
     cursor = conversations.find({"run_id": run_id, "user_id": user_id}).sort("timestamp", 1)
@@ -278,19 +351,16 @@ async def get_conversations(run_id: str, user_id: str = Depends(get_current_user
         "run_id": run_id,
         "conversations": chats
     }
-
 @app.delete("/conversations/{run_id}/{chat_id}")
 async def delete_conversation(run_id: str, chat_id: str, user_id: str = Depends(get_current_user)):
     result = await conversations.delete_one({"chat_id": chat_id, "run_id": run_id, "user_id": user_id})
     if result.deleted_count == 0:
         raise HTTPException(404, "Conversation not found")
     return {"message": "Conversation deleted successfully"}
-
 @app.delete("/conversations/{run_id}")
 async def delete_all_conversations(run_id: str, user_id: str = Depends(get_current_user)):
     result = await conversations.delete_many({"run_id": run_id, "user_id": user_id})
     return {"message": f"Deleted {result.deleted_count} conversations"}
-
 @app.put("/conversations/{run_id}/{chat_id}")
 async def update_conversation(run_id: str, chat_id: str, request: dict, user_id: str = Depends(get_current_user)):
     message = request.get("message")
@@ -312,7 +382,6 @@ async def update_conversation(run_id: str, chat_id: str, request: dict, user_id:
     if result.matched_count == 0:
         raise HTTPException(404, "Conversation not found")
     return {"message": "Conversation updated successfully"}
-
 @app.get("/conversations/{run_id}/download/word")
 async def download_conversations_word(run_id: str, user_id: str = Depends(get_current_user)):
     meeting = await meetings.find_one({"run_id": run_id, "user_id": user_id})
@@ -360,7 +429,6 @@ async def download_conversations_word(run_id: str, user_id: str = Depends(get_cu
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
-
 @app.get("/conversations/{run_id}/download/csv")
 async def download_conversations_csv(run_id: str, user_id: str = Depends(get_current_user)):
     meeting = await meetings.find_one({"run_id": run_id, "user_id": user_id})
@@ -416,7 +484,6 @@ async def download_conversations_csv(run_id: str, user_id: str = Depends(get_cur
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
-
 @app.delete("/meetings/{run_id}")
 async def delete_meeting(run_id: str, user_id: str = Depends(get_current_user)):
     meeting = await meetings.find_one({"run_id": run_id, "user_id": user_id})
@@ -432,7 +499,6 @@ async def delete_meeting(run_id: str, user_id: str = Depends(get_current_user)):
     await meetings.delete_one({"run_id": run_id, "user_id": user_id})
     await conversations.delete_many({"run_id": run_id, "user_id": user_id})
     return {"message": "Meeting and associated conversations deleted successfully"}
-
 @app.put("/meetings/{run_id}")
 async def rename_meeting(run_id: str, request: dict, user_id: str = Depends(get_current_user)):
     filename = request.get("filename")
@@ -446,7 +512,6 @@ async def rename_meeting(run_id: str, request: dict, user_id: str = Depends(get_
     if result.matched_count == 0:
         raise HTTPException(404, "Meeting not found")
     return {"message": "Meeting renamed successfully"}
-
 @app.get("/meetings/{user_id}")
 async def get_all_meetings(user_id: str = Depends(get_current_user)):
     cursor = meetings.find({"user_id": user_id}).sort("created_at", -1)
@@ -467,7 +532,6 @@ async def get_all_meetings(user_id: str = Depends(get_current_user)):
         "user_id": user_id,
         "meetings": simplified_meetings
     }
-
 @app.get("/status/{run_id}")
 async def get_status(run_id: str, user_id: str = Depends(get_current_user)):
     doc = await meetings.find_one({"run_id": run_id, "user_id": user_id})
@@ -479,7 +543,6 @@ async def get_status(run_id: str, user_id: str = Depends(get_current_user)):
         "result": doc.get("result"),
         "language": doc.get("language", "en")
     }
-
 @app.get("/history/{user_id}")
 async def history(user_id: str = Depends(get_current_user)):
     cursor = meetings.find({"user_id": user_id}).sort("created_at", -1).limit(20)
@@ -494,15 +557,12 @@ async def history(user_id: str = Depends(get_current_user)):
         "user_id": user_id,
         "history": docs
     }
-
 @app.get("/")
 async def root():
     return {"message": "Server is running successfully!"}
-
 @app.get("/ping")
 async def ping():
     return {"status": "ok", "message": "TalkToText API is live 🚀"}
-
 @app.get("/test-gemini")
 async def test_gemini():
     from meeting_agents import master_agent
@@ -513,7 +573,6 @@ async def test_gemini():
         input="Hello Gemini! Summarize this meeting: 'We discussed project timelines and assigned tasks.'"
     )
     return {"output": test_result.final_output}
-
 @app.post("/auth/save-user")
 async def save_user(user: dict = Body(...)):
     user_id = user.get("uid")

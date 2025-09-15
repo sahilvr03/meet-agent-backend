@@ -16,19 +16,16 @@ import io
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 # Supported languages for Whisper
 WHISPER_LANGUAGES = {
     "en", "es", "fr", "ur", "ro", "de", "it", "pt", "ru", "zh", "ja", "ko", "ar", "hi"
 }
-
 # Load Whisper model (use 'medium' for better accuracy)
 try:
     WHISPER_MODEL = whisper.load_model("base")
 except Exception as e:
     logger.error(f"Failed to load Whisper model: {e}")
     WHISPER_MODEL = None
-
 @function_tool
 async def transcribe_audio(file_path: str, language: Optional[str] = None) -> str:
     """Transcribe audio to text using Whisper model with specified language."""
@@ -70,7 +67,6 @@ async def transcribe_audio(file_path: str, language: Optional[str] = None) -> st
     except Exception as e:
         logger.error(f"Transcription error: {e}")
         return f"Error transcribing audio: {str(e)}"
-
 @function_tool
 async def translate_text(text: str, target: str = "en") -> str:
     """Translate text to target language using Google Translate API."""
@@ -108,7 +104,6 @@ async def translate_text(text: str, target: str = "en") -> str:
     except Exception as e:
         logger.error(f"Translation error: {e}")
         return f"[Error translating to {target}] {text}"
-
 @function_tool
 async def optimize_text(text: str) -> str:
     """Clean and optimize text by removing fillers, repetitions, and chunking."""
@@ -166,7 +161,6 @@ async def optimize_text(text: str) -> str:
     except Exception as e:
         logger.error(f"Text optimization error: {e}")
         return text
-
 # tools.py (add this new tool for chunked live transcription)
 @function_tool
 async def live_transcribe_chunk(audio_data: bytes, language: Optional[str] = "en") -> str:
@@ -177,8 +171,8 @@ async def live_transcribe_chunk(audio_data: bytes, language: Optional[str] = "en
     try:
         # Save chunk to temporary file for Whisper processing
         temp_path = os.path.join(UPLOAD_DIR, f"live_chunk_{uuid.uuid4()}.wav")
-        audio = AudioSegment.from_file(io.BytesIO(audio_data))  # pydub handles various formats
-        audio = audio.set_channels(1).set_frame_rate(16000)  # Normalize for Whisper
+        audio = AudioSegment.from_file(io.BytesIO(audio_data)) # pydub handles various formats
+        audio = audio.set_channels(1).set_frame_rate(16000) # Normalize for Whisper
         audio.export(temp_path, format="wav")
        
         transcription_language = language if language in WHISPER_LANGUAGES else "en"
@@ -197,7 +191,6 @@ async def live_transcribe_chunk(audio_data: bytes, language: Optional[str] = "en
     except Exception as e:
         logger.error(f"Live transcription chunk error: {e}")
         return f"Error transcribing live chunk: {str(e)}"
-
 @function_tool
 async def generate_meeting_notes(text: str) -> str:
     """Generate detailed and structured meeting notes in JSON format."""
@@ -255,3 +248,50 @@ async def generate_meeting_notes(text: str) -> str:
     except Exception as e:
         logger.error(f"Meeting notes generation error: {e}")
         return json.dumps({"error": f"Failed to generate notes: {str(e)}"})
+
+# New Tool for Recorded Audio Transcription
+@function_tool
+async def transcribe_recorded_audio(audio_blob: bytes, language: Optional[str] = "en") -> str:
+    """
+    Transcribe a recorded audio blob directly using Whisper.
+    This tool handles browser-recorded audio blobs without saving to file first.
+    """
+    if not WHISPER_MODEL:
+        return "Error: Whisper model not loaded."
+    
+    try:
+        # Create temporary file from blob
+        temp_path = os.path.join(UPLOAD_DIR, f"recorded_{uuid.uuid4()}.webm")
+        
+        # Write blob to temp file
+        with open(temp_path, "wb") as f:
+            f.write(audio_blob)
+        
+        # Validate language
+        transcription_language = language if language in WHISPER_LANGUAGES else "en"
+        if language and language not in WHISPER_LANGUAGES:
+            logger.warning(f"Unsupported language {language}, defaulting to English")
+        
+        logger.info(f"Transcribing recorded audio with language: {transcription_language}")
+        
+        # Transcribe with Whisper
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: WHISPER_MODEL.transcribe(temp_path, language=transcription_language, fp16=False)
+        )
+        
+        # Extract transcript
+        transcript_text = result.get("text", "").strip()
+        if not transcript_text:
+            logger.warning("Empty transcription result")
+            return "Error: No transcription generated."
+        
+        # Clean up temp file
+        os.remove(temp_path)
+        
+        logger.info(f"Successfully transcribed recorded audio: {transcript_text[:100]}...")
+        return transcript_text
+        
+    except Exception as e:
+        logger.error(f"Recorded audio transcription error: {e}")
+        return f"Error transcribing recorded audio: {str(e)}"

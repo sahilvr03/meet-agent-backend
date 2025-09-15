@@ -1,9 +1,7 @@
 from agents import Agent, Runner
 from agents.extensions.models.litellm_model import LitellmModel
 from config import API_KEY, MODEL
-from tools import transcribe_audio, translate_text, optimize_text, generate_meeting_notes
-
-
+from tools import transcribe_audio, translate_text, optimize_text, generate_meeting_notes, transcribe_recorded_audio
 # --- Step 1: Base Transcription Agent ---
 piaic_agent = Agent(
     name="TranscriptionAgent",
@@ -18,7 +16,6 @@ piaic_agent = Agent(
     tools=[transcribe_audio, translate_text, optimize_text]
 )
 # meeting_agents.py (add this new agent for live points generation)
-
 # --- Step 2: Translation Agent ---
 translation_agent = piaic_agent.clone(
     name="TranslationAgent",
@@ -28,7 +25,6 @@ translation_agent = piaic_agent.clone(
     ),
     tools=[translate_text]
 )
-
 # --- Step 3: Summarizer Agent ---
 summarizer_agent = piaic_agent.clone(
     name="SummarizerAgent",
@@ -40,7 +36,6 @@ summarizer_agent = piaic_agent.clone(
     ),
     tools=[generate_meeting_notes]
 )
-
 # --- Step 4: Master Orchestrator Agent ---
 master_agent = Agent(
     name="TalkToTextAgent",
@@ -52,10 +47,9 @@ master_agent = Agent(
         "Ensure each step is executed with high accuracy and the final output is comprehensive and well-structured."
     ),
     model=LitellmModel(model=MODEL, api_key=API_KEY),
-    tools=[transcribe_audio, translate_text, optimize_text, generate_meeting_notes],
+    tools=[transcribe_audio, translate_text, optimize_text, generate_meeting_notes, transcribe_recorded_audio],
     handoffs=[translation_agent, summarizer_agent]
 )
-
 live_points_agent = summarizer_agent.clone(
     name="LivePointsAgent",
     instructions=(
@@ -63,10 +57,18 @@ live_points_agent = summarizer_agent.clone(
         "decisions, and action items as the meeting progresses. Update incrementally without repeating previous points. "
         "Keep summaries concise for live updates."
     ),
-    tools=[generate_meeting_notes]
+    tools=[generate_meeting_notes, transcribe_recorded_audio]
 )
 # --- Step 5: Run Everything ---
 def run_pipeline(file_path: str, language: str = "en"):
     context = {"file_path": file_path, "language": language}
     result = Runner.run_sync(master_agent, input=context)
+    return result.final_output
+
+# New function for recorded audio processing
+async def process_recorded_audio(audio_blob: bytes, language: str = "en"):
+    """Process a recorded audio blob through the full pipeline."""
+    context = {"audio_blob": audio_blob, "language": language}
+    runner = Runner()
+    result = await runner.run(master_agent, input=context)
     return result.final_output
